@@ -1,6 +1,6 @@
 ---
 name: hud-colorway
-description: List, preview, or switch the color scheme (colorway) of the agent-hud status-line HUD. agent-hud ships four built-in colorways rendered with truecolor ANSI — gruvbox (default, warm), catppuccin (matches the Catppuccin Mocha terminal theme), tokyonight, and mono (labels only, values left in the default foreground). The active colorway resolves in this order: the AGENT_HUD_COLORWAY environment variable, then `colorway=<name>` in ~/.config/agent-hud/config, else gruvbox. Use when the user wants to change the HUD colors, see what colorways exist, preview them, set a persistent default, or use a one-off colorway for a single session. For installing or wiring the HUD itself, use the hud-setup skill instead.
+description: List, preview, or switch the color scheme (colorway) of the agent-hud status-line HUD. agent-hud ships four built-in colorways rendered with truecolor ANSI — gruvbox (default, warm), catppuccin (matches the Catppuccin Mocha terminal theme), tokyonight, and mono (labels only, values left in the default foreground). The active colorway resolves in this order — first the AGENT_HUD_COLORWAY environment variable, then `colorway=<name>` in ~/.config/agent-hud/config, else gruvbox. Use when the user wants to change the HUD colors, see what colorways exist, preview them, set a persistent default, or use a one-off colorway for a single session. For installing or wiring the HUD itself, use the hud-setup skill instead.
 ---
 
 # agent-hud — Colorways
