@@ -1,4 +1,4 @@
-# agent-hud
+# system-hud
 
 A portable **two-level resource HUD** for AI-agent status lines. One core script
 (`bin/agent-hud`) renders the same HUD; thin adapters wire it into each agent.
