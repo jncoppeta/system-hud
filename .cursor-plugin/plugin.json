@@ -1,0 +1,32 @@
+{
+  "name": "agent-hud",
+  "description": "Two-level resource HUD for agent status lines \u2014 a top line for THIS TUI session (CPU/MEM summed across the session's controlling tty + pwd size) and a bottom line for the whole machine (CPU/MEM + free disk on the cwd's volume). One core bash script renders the HUD; a launchd daemon samples system CPU%; thin per-agent adapters wire it into Claude Code (and stub Codex/opencode). Swappable colorways (gruvbox default, catppuccin, tokyonight, mono). macOS.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Joseph Coppeta"
+  },
+  "homepage": "https://github.com/jncoppeta/system-hud",
+  "repository": "https://github.com/jncoppeta/system-hud",
+  "category": "engineering",
+  "keywords": [
+    "hud",
+    "statusline",
+    "monitoring",
+    "cpu",
+    "memory",
+    "disk",
+    "macos",
+    "developer-tools"
+  ],
+  "tags": [
+    "hud",
+    "statusline",
+    "monitoring",
+    "cpu",
+    "memory",
+    "disk",
+    "macos",
+    "developer-tools"
+  ],
+  "skills": "./skills"
+}

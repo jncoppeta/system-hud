@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# agent-hud — portable two-level resource HUD for agent status lines.
+#   Top level  = THIS TUI session (CPU/MEM of all procs in the session + pwd size)
+#   Bottom level = whole machine  (CPU/MEM + free disk on cwd's volume)
+# Subcommands: render | daemon | colorways | help
+# Colorways are swappable; default is gruvbox (override: AGENT_HUD_COLORWAY or config).
+
+set -u
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/agent-hud"
+SYS_CACHE="$CACHE_DIR/sys"          # one line: system CPU%% (integer)
+PWD_CACHE_DIR="$CACHE_DIR/pwd"      # per-cwd: "<kb> <epoch>"
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/agent-hud/config"
+mkdir -p "$CACHE_DIR" "$PWD_CACHE_DIR" 2>/dev/null
+
+DAEMON_INTERVAL="${AGENT_HUD_INTERVAL:-2}"   # daemon sample cadence (s)
+SYS_STALE=6                                  # sys cache older than this -> fallback
+PWD_TTL="${AGENT_HUD_PWD_TTL:-10}"           # pwd-size cache freshness (s)
+PWD_TIMEOUT="${AGENT_HUD_PWD_TIMEOUT:-0.3}"  # max blocking time for du (s)
+
+# ---------- colorways -------------------------------------------------------
+# Each sets truecolor escapes: CSESS CSYS CCPU CMEM CSTORE CDIM (and bold flag).
+R=$'\033[0m'
+_rgb() { printf '\033[38;2;%s;%s;%sm' "$1" "$2" "$3"; }
+
+resolve_colorway() {
+  local cw="${AGENT_HUD_COLORWAY:-}"
+  if [ -z "$cw" ] && [ -f "$CONFIG" ]; then
+    cw=$(awk -F= '/^colorway/{gsub(/[ \t]/,"",$2); print $2}' "$CONFIG" 2>/dev/null)
+  fi
+  cw=$(printf '%s' "${cw:-gruvbox}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+  SESS_BOLD=""
+  case "$cw" in
+    catppuccin|mocha|catppuccin-mocha)
+      CSESS=$(_rgb 203 166 247); CSYS=$(_rgb 137 180 250)
+      CCPU=$(_rgb 249 226 175);  CMEM=$(_rgb 166 227 161)
+      CSTORE=$(_rgb 250 179 135); CDIM=$(_rgb 108 112 134) ;;
+    tokyo|tokyonight|tokyo-night)
+      CSESS=$(_rgb 187 154 247); CSYS=$(_rgb 122 162 247)
+      CCPU=$(_rgb 224 175 104);  CMEM=$(_rgb 158 206 106)
+      CSTORE=$(_rgb 255 158 100); CDIM=$(_rgb 86 95 137) ;;
+    mono|minimal)
+      CSESS=$(_rgb 255 255 255); CSYS=$(_rgb 255 255 255)
+      CCPU=$(_rgb 205 214 244);  CMEM=$(_rgb 205 214 244)
+      CSTORE=$(_rgb 205 214 244); CDIM=$(_rgb 88 91 112); SESS_BOLD=$'\033[1m' ;;
+    gruvbox|*)
+      CSESS=$(_rgb 211 134 155); CSYS=$(_rgb 131 165 152)
+      CCPU=$(_rgb 250 189 47);   CMEM=$(_rgb 184 187 38)
+      CSTORE=$(_rgb 254 128 25); CDIM=$(_rgb 146 131 116) ;;
+  esac
+  COLORWAY="$cw"
+}
+
+# ---------- helpers ---------------------------------------------------------
+now() { date +%s; }
+mtime() { stat -f %m "$1" 2>/dev/null || echo 0; }
+
+kb2h() { # KB -> human (M/G)
+  awk -v k="$1" 'BEGIN{
+    if (k < 1024) { printf "%dK", k }
+    else if (k < 1048576) { printf "%.0fM", k/1024 }
+    else { printf "%.1fG", k/1048576 }
+  }'
+}
+b2h() { # bytes -> human
+  awk -v b="$1" 'BEGIN{
+    if (b < 1048576) { printf "%.0fM", b/1048576 }
+    else { printf "%.1fG", b/1073741824 }
+  }'
+}
+
+# ---------- system CPU%% -----------------------------------------------------
+sys_cpu() {
+  if [ -f "$SYS_CACHE" ] && [ $(( $(now) - $(mtime "$SYS_CACHE") )) -le "$SYS_STALE" ]; then
+    cat "$SYS_CACHE"; return
+  fi
+  # fallback: load average normalised by core count
+  local la ncpu
+  la=$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}')
+  ncpu=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
+  awk -v la="${la:-0}" -v n="${ncpu:-1}" 'BEGIN{p=la/n*100; if(p>100)p=100; printf "%d", p}'
+}
+
+sample_sys_cpu() { # blocking ~1s; used by daemon
+  top -l 2 -s 1 -n 0 2>/dev/null \
+    | awk '/CPU usage/{l=$0} END{ if (match(l,/([0-9.]+)% idle/)) {
+        s=substr(l,RSTART,RLENGTH); gsub(/% idle/,"",s); printf "%d", 100-s } else print "0" }'
+}
+
+# ---------- system memory ---------------------------------------------------
+sys_mem() { # echoes "USED_BYTES TOTAL_BYTES"
+  local ps total stats active wired comp
+  ps=$(sysctl -n hw.pagesize 2>/dev/null || echo 4096)
+  total=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+  stats=$(vm_stat 2>/dev/null)
+  active=$(printf '%s' "$stats" | awk '/Pages active/{gsub(/[^0-9]/,"",$3);print $3}')
+  wired=$(printf '%s' "$stats"  | awk '/Pages wired down/{gsub(/[^0-9]/,"",$4);print $4}')
+  comp=$(printf '%s' "$stats"   | awk '/occupied by compressor/{gsub(/[^0-9]/,"",$5);print $5}')
+  awk -v a="${active:-0}" -v w="${wired:-0}" -v c="${comp:-0}" -v p="$ps" -v t="$total" \
+    'BEGIN{ printf "%.0f %s", (a+w+c)*p, t }'
+}
+
+# ---------- this session (CPU + MEM) ----------------------------------------
+# "Session" = all processes sharing this pane's controlling tty (shell + agent +
+# children). macOS ps has no numeric SID, but tty groups a TUI session cleanly.
+session_tty() { # walk parents until one has a real controlling tty
+  local pid=$$ tty i
+  for i in 1 2 3 4 5 6 7 8; do
+    tty=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')
+    case "$tty" in ''|'?'|'??') : ;; *) printf '%s' "$tty"; return ;; esac
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    { [ -z "$pid" ] || [ "$pid" = 0 ]; } && break
+  done
+}
+
+session_stats() { # echoes "CPU_INT RSS_BYTES"
+  local tty; tty=$(session_tty)
+  [ -z "$tty" ] && { echo "0 0"; return; }
+  ps -t "$tty" -o pcpu=,rss= 2>/dev/null \
+    | awk '{ cpu+=$1; rss+=$2 } END { printf "%d %.0f", cpu, rss*1024 }'
+}
+
+# ---------- pwd size (live du + timeout + async cache) ----------------------
+pwd_size() { # arg: dir -> echoes human size (or "..." while warming)
+  local dir="$1" key cf val ts age
+  key=$(printf '%s' "$dir" | cksum | awk '{print $1}')
+  cf="$PWD_CACHE_DIR/$key"
+  val=""; ts=0
+  if [ -f "$cf" ]; then val=$(awk '{print $1}' "$cf"); ts=$(awk '{print $2}' "$cf"); fi
+  age=$(( $(now) - ${ts:-0} ))
+  if [ -z "$val" ] || [ "$age" -ge "$PWD_TTL" ]; then
+    # refresh in background, non-blocking; lock prevents pile-up
+    if mkdir "$cf.lock" 2>/dev/null; then
+      ( kb=$(du -sk "$dir" 2>/dev/null | awk '{print $1}'); \
+        [ -n "$kb" ] && printf '%s %s\n' "$kb" "$(now)" > "$cf"; \
+        rmdir "$cf.lock" 2>/dev/null ) &
+    fi
+    # give a fast dir a brief chance to populate before we give up
+    local waited=0
+    while [ -d "$cf.lock" ] && awk -v w="$waited" -v t="$PWD_TIMEOUT" 'BEGIN{exit !(w<t)}'; do
+      sleep 0.05; waited=$(awk -v w="$waited" 'BEGIN{print w+0.05}')
+    done
+    [ -f "$cf" ] && val=$(awk '{print $1}' "$cf")
+  fi
+  if [ -n "$val" ]; then kb2h "$val"; else printf '…'; fi
+}
+
+# ---------- disk (free on cwd volume) ---------------------------------------
+disk_free() { # arg: dir -> echoes "FREE_H CAP" e.g. "312G 22%"
+  df -k "$1" 2>/dev/null | awk 'NR==2{ free=$4; cap=$5; printf "%s %s", free, cap }' \
+    | { read -r free cap; printf '%s %s' "$(kb2h "$free")" "$cap"; }
+}
+
+# ---------- render ----------------------------------------------------------
+cmd_render() {
+  local cwd="$PWD"
+  while [ $# -gt 0 ]; do case "$1" in --cwd) cwd="$2"; shift 2;; *) shift;; esac; done
+  [ -d "$cwd" ] || cwd="$PWD"
+  resolve_colorway
+
+  # session
+  local s_cpu s_rss; read -r s_cpu s_rss <<EOF
+$(session_stats)
+EOF
+  # system mem
+  local m_used m_total; read -r m_used m_total <<EOF
+$(sys_mem)
+EOF
+  local sys_cpu_v; sys_cpu_v=$(sys_cpu)
+  local pwd_h; pwd_h=$(pwd_size "$cwd")
+  local d_free d_cap; read -r d_free d_cap <<EOF
+$(disk_free "$cwd")
+EOF
+
+  # derived strings
+  local s_mem_h s_mem_pct sys_mem_str sys_mem_pct
+  s_mem_h=$(b2h "${s_rss:-0}")
+  s_mem_pct=$(awk -v u="${s_rss:-0}" -v t="${m_total:-1}" 'BEGIN{printf "%d", (t>0)?u/t*100:0}')
+  sys_mem_str="$(b2h "${m_used:-0}")/$(b2h "${m_total:-0}")"
+  sys_mem_pct=$(awk -v u="${m_used:-0}" -v t="${m_total:-1}" 'BEGIN{printf "%d", (t>0)?u/t*100:0}')
+
+  local sess_mem="${s_mem_h} (${s_mem_pct}%)"
+  local sys_mem="${sys_mem_str} (${sys_mem_pct}%)"
+  local disk_str="${d_free} free (${d_cap} used)"
+
+  # line 1: session  (labels padded so columns align with line 2)
+  printf '%b⊳ session%b   %bCPU%b %b%4s%%%b   %bMEM%b %b%-18s%b %bpwd %b %b%s%b\n' \
+    "$SESS_BOLD$CSESS" "$R" "$CDIM" "$R" "$CCPU" "$s_cpu" "$R" \
+    "$CDIM" "$R" "$CMEM" "$sess_mem" "$R" "$CDIM" "$R" "$CSTORE" "$pwd_h" "$R"
+  # line 2: system
+  printf '%b⊳ system %b   %bCPU%b %b%4s%%%b   %bMEM%b %b%-18s%b %bdisk%b %b%s%b\n' \
+    "$SESS_BOLD$CSYS" "$R" "$CDIM" "$R" "$CCPU" "$sys_cpu_v" "$R" \
+    "$CDIM" "$R" "$CMEM" "$sys_mem" "$R" "$CDIM" "$R" "$CSTORE" "$disk_str" "$R"
+}
+
+# ---------- daemon ----------------------------------------------------------
+cmd_daemon() {
+  while :; do
+    sample_sys_cpu > "$SYS_CACHE.tmp" 2>/dev/null && mv "$SYS_CACHE.tmp" "$SYS_CACHE"
+    sleep "$DAEMON_INTERVAL"
+  done
+}
+
+cmd_colorways() {
+  echo "Available colorways (set AGENT_HUD_COLORWAY=<name> or colorway=<name> in $CONFIG):"
+  echo "  gruvbox      (default, warm)"
+  echo "  catppuccin   (matches Catppuccin Mocha)"
+  echo "  tokyonight"
+  echo "  mono         (labels only)"
+}
+
+cmd_help() {
+  cat <<EOF
+agent-hud — two-level resource HUD for agent status lines
+
+USAGE
+  agent-hud render [--cwd DIR]   print the 2-line HUD (session / system)
+  agent-hud daemon               sample system CPU%% into the cache (run via launchd)
+  agent-hud colorways            list built-in colorways
+  agent-hud help
+
+CONFIG
+  AGENT_HUD_COLORWAY   colorway name (default: gruvbox)
+  $CONFIG              optional, e.g.  colorway=gruvbox
+EOF
+}
+
+case "${1:-render}" in
+  render)    shift; cmd_render "$@" ;;
+  daemon)    cmd_daemon ;;
+  colorways) cmd_colorways ;;
+  help|-h|--help) cmd_help ;;
+  *) cmd_render "$@" ;;
+esac

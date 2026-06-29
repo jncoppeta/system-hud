@@ -1,0 +1,8 @@
+{
+    "name": "agent-hud",
+    "description": "Two-level resource HUD for agent status lines — a top line for THIS TUI session (CPU/MEM summed across the session's controlling tty + pwd size) and a bottom line for the whole machine (CPU/MEM + free disk on the cwd's volume). One core bash script renders the HUD; a launchd daemon samples system CPU%; thin per-agent adapters wire it into Claude Code (and stub Codex/opencode). Swappable colorways (gruvbox default, catppuccin, tokyonight, mono). macOS.",
+    "author": {
+        "name": "Joseph Coppeta"
+    },
+    "skills": "./skills"
+}
