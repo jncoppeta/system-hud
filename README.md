@@ -75,6 +75,10 @@ agent-hud/
 
 - macOS + Linux (bash + coreutils). macOS reads `top`/`vm_stat`/`sysctl`; Linux
   reads `/proc/stat`/`/proc/meminfo`/`/proc/loadavg`. No other deps.
+- Container-aware on Linux: in a Kubernetes pod / Docker container the system
+  CPU%/MEM reflect the **cgroup limits** (cgroup v2 `memory.max`/`cpu.max`/
+  `cpu.stat`, or v1 equivalents), not the host node. Falls back to `/proc` when
+  no cgroup limit is set (bare metal unchanged).
 - "Session" = the controlling tty of the agent process. Daemons launched outside
   the pane are correctly excluded.
 - `du` on a huge tree shows the last cached value (or `…` on first sight) rather

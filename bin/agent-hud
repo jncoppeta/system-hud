@@ -8,6 +8,7 @@
 set -u
 
 OS="$(uname -s)"                            # Darwin | Linux
+CG="/sys/fs/cgroup"                         # cgroup root (Linux containers)
 
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/agent-hud"
 SYS_CACHE="$CACHE_DIR/sys"          # one line: system CPU%% (integer)
@@ -61,6 +62,83 @@ else
   mtime() { stat -c %Y "$1" 2>/dev/null || echo 0; }
 fi
 
+# ---------- cgroup helpers (Linux containers) -------------------------------
+# Inside a k8s pod / Docker container, /proc/meminfo, /proc/stat and nproc all
+# report the host NODE, not the container's cgroup limits. When cgroup limits
+# are present we prefer them; otherwise every helper echoes nothing and the
+# caller falls back to the /proc behaviour (bare metal is unaffected).
+proc_mem_total() { awk '/^MemTotal:/{printf "%.0f", $2*1024}' /proc/meminfo 2>/dev/null; }
+
+cg_v1_cpu_dir() {     # locate cgroup v1 cpu controller (mount layout varies)
+  local d; for d in "$CG/cpu" "$CG/cpu,cpuacct"; do
+    [ -f "$d/cpu.cfs_quota_us" ] && { printf '%s' "$d"; return; }
+  done
+}
+cg_v1_cpuacct_dir() {
+  local d; for d in "$CG/cpuacct" "$CG/cpu,cpuacct"; do
+    [ -f "$d/cpuacct.usage" ] && { printf '%s' "$d"; return; }
+  done
+}
+
+cgroup_mem() {        # echoes "USED TOTAL" (bytes) if memory-limited, else nothing
+  local lim cur inact node
+  node=$(proc_mem_total)
+  if [ -f "$CG/memory.max" ] && [ -f "$CG/memory.current" ]; then            # v2
+    lim=$(cat "$CG/memory.max" 2>/dev/null)
+    cur=$(cat "$CG/memory.current" 2>/dev/null)
+    inact=$(awk '/^inactive_file /{print $2}' "$CG/memory.stat" 2>/dev/null)
+  elif [ -f "$CG/memory/memory.limit_in_bytes" ] && [ -f "$CG/memory/memory.usage_in_bytes" ]; then  # v1
+    lim=$(cat "$CG/memory/memory.limit_in_bytes" 2>/dev/null)
+    cur=$(cat "$CG/memory/memory.usage_in_bytes" 2>/dev/null)
+    inact=$(awk '/^total_inactive_file /{print $2}' "$CG/memory/memory.stat" 2>/dev/null)
+  else
+    return
+  fi
+  case "$lim" in ''|max) return;; esac
+  # Treat limit <= 0, non-numeric, or >= node RAM (the unlimited/PAGE_COUNTER_MAX
+  # sentinel) as "not constrained" -> fall back to /proc. used = current minus
+  # reclaimable page cache, which is closer to what k8s/OOM accounts.
+  awk -v l="$lim" -v c="$cur" -v i="${inact:-0}" -v n="${node:-0}" 'BEGIN{
+    if (l+0 <= 0 || (n>0 && l+0 >= n)) exit 1;
+    u = c - i; if (u < 0) u = c;
+    printf "%.0f %.0f", u, l }' || return
+}
+
+cgroup_cpu_cores() {  # echoes the CPU quota in cores (float) if limited, else nothing
+  local q p d
+  if [ -f "$CG/cpu.max" ]; then                                             # v2
+    read -r q p _ < "$CG/cpu.max" 2>/dev/null
+    [ "$q" = max ] && return
+  else                                                                      # v1
+    d=$(cg_v1_cpu_dir); [ -z "$d" ] && return
+    q=$(cat "$d/cpu.cfs_quota_us" 2>/dev/null)   # -1 when unlimited
+    p=$(cat "$d/cpu.cfs_period_us" 2>/dev/null)
+  fi
+  awk -v q="${q:-0}" -v p="${p:-0}" 'BEGIN{
+    if (q+0<=0 || p+0<=0) exit 1; printf "%.4f", q/p }' || return
+}
+
+cgroup_cpu_usage_usec() {  # cumulative CPU usage in microseconds, else nothing
+  local d
+  if [ -f "$CG/cpu.stat" ]; then                                            # v2
+    awk '/^usage_usec /{print $2}' "$CG/cpu.stat" 2>/dev/null
+  else                                                                      # v1 (ns->us)
+    d=$(cg_v1_cpuacct_dir); [ -z "$d" ] && return
+    awk '{printf "%.0f", $1/1000}' "$d/cpuacct.usage" 2>/dev/null
+  fi
+}
+
+sample_cgroup_cpu() {  # arg: quota cores. CPU-time delta over 1s, normalised by quota
+  local cores="$1" u1 u2
+  u1=$(cgroup_cpu_usage_usec)
+  sleep 1
+  u2=$(cgroup_cpu_usage_usec)
+  awk -v a="${u1:-0}" -v b="${u2:-0}" -v c="$cores" 'BEGIN{
+    du=b-a; win=1000000*c;          # CPU-us used vs CPU-us available in the window
+    if (win<=0 || du<0) { print 0; exit }
+    p=du/win*100; if(p<0)p=0; if(p>100)p=100; printf "%d", p }'
+}
+
 kb2h() { # KB -> human (M/G)
   awk -v k="$1" 'BEGIN{
     if (k < 1024) { printf "%dK", k }
@@ -87,7 +165,7 @@ sys_cpu() {
     ncpu=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
   else
     la=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
-    ncpu=$(nproc 2>/dev/null || echo 1)
+    ncpu=$(cgroup_cpu_cores); [ -z "$ncpu" ] && ncpu=$(nproc 2>/dev/null || echo 1)
   fi
   awk -v la="${la:-0}" -v n="${ncpu:-1}" 'BEGIN{p=la/n*100; if(p>100)p=100; printf "%d", p}'
 }
@@ -98,6 +176,10 @@ sample_sys_cpu() { # blocking ~1s; used by daemon
       | awk '/CPU usage/{l=$0} END{ if (match(l,/([0-9.]+)% idle/)) {
           s=substr(l,RSTART,RLENGTH); gsub(/% idle/,"",s); printf "%d", 100-s } else print "0" }'
   else
+    # In a container, prefer cgroup CPU-time delta normalised by the quota;
+    # /proc/stat is node-scoped and would understate the pod's true CPU%.
+    local cores; cores=$(cgroup_cpu_cores)
+    [ -n "$cores" ] && { sample_cgroup_cpu "$cores"; return; }
     # /proc/stat delta: busy = total - idle, over a 1s window
     local r1 r2
     r1=$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $5+$6}' /proc/stat 2>/dev/null)
@@ -125,6 +207,9 @@ sys_mem() { # echoes "USED_BYTES TOTAL_BYTES"
     awk -v a="${active:-0}" -v w="${wired:-0}" -v c="${comp:-0}" -v p="$ps" -v t="$total" \
       'BEGIN{ printf "%.0f %s", (a+w+c)*p, t }'
   else
+    # Prefer cgroup limits inside a container; else fall back to /proc/meminfo.
+    local cg; cg=$(cgroup_mem)
+    [ -n "$cg" ] && { printf '%s' "$cg"; return; }
     # /proc/meminfo is in kB; used = total - available
     awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{
       if (a=="") a=t;   # pre-3.14 kernels lack MemAvailable
