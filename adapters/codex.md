@@ -1,27 +1,18 @@
-# Codex adapter (stub)
+# Codex adapter
 
-Codex CLI is not installed on this machine yet, so this adapter is a
-placeholder. Wire it once Codex is available.
+Codex is not wired by this project today.
 
-## Goal
+Current Codex builds expose a built-in TUI footer, but not a documented
+Claude-style shell-command statusline hook. Because `agent-hud` needs Codex to
+run `agent-hud render --cwd <session cwd>` on each footer refresh, there is no
+repo-side Codex setup to apply yet.
 
-Call `agent-hud render --cwd <session cwd>` and surface the two HUD lines in
-Codex's status/footer area.
+Use the Claude Code adapter for the live two-line HUD, or run the renderer on
+demand:
 
-## When Codex is installed
+```sh
+bin/agent-hud render --cwd "$PWD"
+```
 
-1. Check whether Codex supports a custom status line / footer command in its
-   config (`~/.codex/config.*`). If it pipes context (cwd, model) to a command
-   like Claude does, point it at:
-
-   ```sh
-   agent-hud render --cwd "$CODEX_CWD"
-   ```
-
-2. If Codex has no statusline hook, fall back to a keybinding or a prompt-prefix
-   that runs `agent-hud render` on demand.
-
-3. The core `agent-hud` script is agent-agnostic — only the cwd source and the
-   render trigger differ per agent. No changes to `bin/agent-hud` needed.
-
-> TODO: confirm Codex's statusline/footer extension mechanism and fill in.
+If Codex later adds a custom command statusline/footer hook, this adapter should
+wire that hook to `agent-hud render --cwd <codex cwd>`.

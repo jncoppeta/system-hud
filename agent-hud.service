@@ -1,0 +1,14 @@
+[Unit]
+Description=agent-hud system CPU sampler
+
+[Service]
+Type=simple
+ExecStart=__BIN__ daemon
+Restart=always
+RestartSec=2
+Nice=10
+IOSchedulingClass=idle
+StandardError=append:__CACHE__/daemon.err
+
+[Install]
+WantedBy=default.target

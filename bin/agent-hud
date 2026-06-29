@@ -7,6 +7,8 @@
 
 set -u
 
+OS="$(uname -s)"                            # Darwin | Linux
+
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/agent-hud"
 SYS_CACHE="$CACHE_DIR/sys"          # one line: system CPU%% (integer)
 PWD_CACHE_DIR="$CACHE_DIR/pwd"      # per-cwd: "<kb> <epoch>"
@@ -53,7 +55,11 @@ resolve_colorway() {
 
 # ---------- helpers ---------------------------------------------------------
 now() { date +%s; }
-mtime() { stat -f %m "$1" 2>/dev/null || echo 0; }
+if [ "$OS" = Darwin ]; then
+  mtime() { stat -f %m "$1" 2>/dev/null || echo 0; }
+else
+  mtime() { stat -c %Y "$1" 2>/dev/null || echo 0; }
+fi
 
 kb2h() { # KB -> human (M/G)
   awk -v k="$1" 'BEGIN{
@@ -76,28 +82,54 @@ sys_cpu() {
   fi
   # fallback: load average normalised by core count
   local la ncpu
-  la=$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}')
-  ncpu=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
+  if [ "$OS" = Darwin ]; then
+    la=$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}')
+    ncpu=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
+  else
+    la=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
+    ncpu=$(nproc 2>/dev/null || echo 1)
+  fi
   awk -v la="${la:-0}" -v n="${ncpu:-1}" 'BEGIN{p=la/n*100; if(p>100)p=100; printf "%d", p}'
 }
 
 sample_sys_cpu() { # blocking ~1s; used by daemon
-  top -l 2 -s 1 -n 0 2>/dev/null \
-    | awk '/CPU usage/{l=$0} END{ if (match(l,/([0-9.]+)% idle/)) {
-        s=substr(l,RSTART,RLENGTH); gsub(/% idle/,"",s); printf "%d", 100-s } else print "0" }'
+  if [ "$OS" = Darwin ]; then
+    top -l 2 -s 1 -n 0 2>/dev/null \
+      | awk '/CPU usage/{l=$0} END{ if (match(l,/([0-9.]+)% idle/)) {
+          s=substr(l,RSTART,RLENGTH); gsub(/% idle/,"",s); printf "%d", 100-s } else print "0" }'
+  else
+    # /proc/stat delta: busy = total - idle, over a 1s window
+    local r1 r2
+    r1=$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $5+$6}' /proc/stat 2>/dev/null)
+    sleep 1
+    r2=$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $5+$6}' /proc/stat 2>/dev/null)
+    awk -v a="$r1" -v b="$r2" 'BEGIN{
+      na=split(a,x," "); nb=split(b,y," ");
+      if (na<2 || nb<2) { print "0"; exit }
+      dt=y[1]-x[1]; di=y[2]-x[2];
+      if (dt<=0) { print "0" } else { p=(dt-di)/dt*100; if(p<0)p=0; if(p>100)p=100; printf "%d", p }
+    }'
+  fi
 }
 
 # ---------- system memory ---------------------------------------------------
 sys_mem() { # echoes "USED_BYTES TOTAL_BYTES"
-  local ps total stats active wired comp
-  ps=$(sysctl -n hw.pagesize 2>/dev/null || echo 4096)
-  total=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
-  stats=$(vm_stat 2>/dev/null)
-  active=$(printf '%s' "$stats" | awk '/Pages active/{gsub(/[^0-9]/,"",$3);print $3}')
-  wired=$(printf '%s' "$stats"  | awk '/Pages wired down/{gsub(/[^0-9]/,"",$4);print $4}')
-  comp=$(printf '%s' "$stats"   | awk '/occupied by compressor/{gsub(/[^0-9]/,"",$5);print $5}')
-  awk -v a="${active:-0}" -v w="${wired:-0}" -v c="${comp:-0}" -v p="$ps" -v t="$total" \
-    'BEGIN{ printf "%.0f %s", (a+w+c)*p, t }'
+  if [ "$OS" = Darwin ]; then
+    local ps total stats active wired comp
+    ps=$(sysctl -n hw.pagesize 2>/dev/null || echo 4096)
+    total=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+    stats=$(vm_stat 2>/dev/null)
+    active=$(printf '%s' "$stats" | awk '/Pages active/{gsub(/[^0-9]/,"",$3);print $3}')
+    wired=$(printf '%s' "$stats"  | awk '/Pages wired down/{gsub(/[^0-9]/,"",$4);print $4}')
+    comp=$(printf '%s' "$stats"   | awk '/occupied by compressor/{gsub(/[^0-9]/,"",$5);print $5}')
+    awk -v a="${active:-0}" -v w="${wired:-0}" -v c="${comp:-0}" -v p="$ps" -v t="$total" \
+      'BEGIN{ printf "%.0f %s", (a+w+c)*p, t }'
+  else
+    # /proc/meminfo is in kB; used = total - available
+    awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{
+      if (a=="") a=t;   # pre-3.14 kernels lack MemAvailable
+      printf "%.0f %.0f", (t-a)*1024, t*1024 }' /proc/meminfo 2>/dev/null
+  fi
 }
 
 # ---------- this session (CPU + MEM) ----------------------------------------
@@ -147,7 +179,7 @@ pwd_size() { # arg: dir -> echoes human size (or "..." while warming)
 
 # ---------- disk (free on cwd volume) ---------------------------------------
 disk_free() { # arg: dir -> echoes "FREE_H CAP" e.g. "312G 22%"
-  df -k "$1" 2>/dev/null | awk 'NR==2{ free=$4; cap=$5; printf "%s %s", free, cap }' \
+  df -kP "$1" 2>/dev/null | awk 'NR==2{ free=$4; cap=$5; printf "%s %s", free, cap }' \
     | { read -r free cap; printf '%s %s' "$(kb2h "$free")" "$cap"; }
 }
 
@@ -215,7 +247,7 @@ agent-hud — two-level resource HUD for agent status lines
 
 USAGE
   agent-hud render [--cwd DIR]   print the 2-line HUD (session / system)
-  agent-hud daemon               sample system CPU%% into the cache (run via launchd)
+  agent-hud daemon               sample system CPU%% into the cache (run via launchd/systemd)
   agent-hud colorways            list built-in colorways
   agent-hud help
 
