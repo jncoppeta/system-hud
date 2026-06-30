@@ -30,9 +30,38 @@ with `AGENT_HUD_VIEW=classic|graph|pie` (or run the subcommand directly):
 ```
 
 `graph` reads a small per-tty history ring buffer that every render feeds (one
-sample per `AGENT_HUD_HIST_STEP` seconds, kept for `AGENT_HUD_HIST_WINDOW`).
+sample per `AGENT_HUD_HIST_STEP` seconds, kept for `AGENT_HUD_HIST_WINDOW`), so
+it fills in left→right over ~30 min; `pie` is instantaneous and needs no history.
 `graph`/`pie` default to the `lavish` colorway unless you set one explicitly.
 See `agent-hud help` for `AGENT_HUD_GRAPH_W` / `AGENT_HUD_PIE_W` and friends.
+
+### Switching views
+
+`classic` is the default. Pick a view by setting `AGENT_HUD_VIEW` to one of
+`classic` | `graph` | `pie`:
+
+```bash
+# one-off, in any shell
+AGENT_HUD_VIEW=graph agent-hud render        # or: agent-hud graph
+AGENT_HUD_VIEW=pie   agent-hud render         # or: agent-hud pie
+agent-hud classic                              # back to the two-line default
+```
+
+To change the view in your **status line**, set the variable on the line your
+adapter uses to call the HUD. For the Claude Code adapter that line lives in
+`~/.claude/statusline-command.sh`:
+
+```bash
+# classic (no var needed):
+__HUD=$("…/agent-hud" render --cwd "$CWD" 2>/dev/null)
+# graph:
+__HUD=$(AGENT_HUD_VIEW=graph "…/agent-hud" render --cwd "$CWD" 2>/dev/null)
+# pie:
+__HUD=$(AGENT_HUD_VIEW=pie   "…/agent-hud" render --cwd "$CWD" 2>/dev/null)
+```
+
+Save and the next status-line refresh shows the new view. Add
+`AGENT_HUD_COLORWAY=lavish` on the same line for the amethyst/gold palette.
 
 ## How it works
 
