@@ -13,13 +13,16 @@ CG="/sys/fs/cgroup"                         # cgroup root (Linux containers)
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/agent-hud"
 SYS_CACHE="$CACHE_DIR/sys"          # one line: system CPU%% (integer)
 PWD_CACHE_DIR="$CACHE_DIR/pwd"      # per-cwd: "<kb> <epoch>"
+HIST_DIR="$CACHE_DIR/hist"          # per-tty time-series: "<epoch> scpu smem syscpu symem"
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/agent-hud/config"
-mkdir -p "$CACHE_DIR" "$PWD_CACHE_DIR" 2>/dev/null
+mkdir -p "$CACHE_DIR" "$PWD_CACHE_DIR" "$HIST_DIR" 2>/dev/null
 
 DAEMON_INTERVAL="${AGENT_HUD_INTERVAL:-2}"   # daemon sample cadence (s)
 SYS_STALE=6                                  # sys cache older than this -> fallback
 PWD_TTL="${AGENT_HUD_PWD_TTL:-10}"           # pwd-size cache freshness (s)
 PWD_TIMEOUT="${AGENT_HUD_PWD_TIMEOUT:-0.3}"  # max blocking time for du (s)
+HIST_WINDOW="${AGENT_HUD_HIST_WINDOW:-1800}" # graph time span (s) -> 30 min
+HIST_STEP="${AGENT_HUD_HIST_STEP:-5}"        # min spacing between recorded samples (s)
 
 # ---------- colorways -------------------------------------------------------
 # Each sets truecolor escapes: CSESS CSYS CCPU CMEM CSTORE CDIM (and bold flag).
@@ -33,24 +36,34 @@ resolve_colorway() {
   fi
   cw=$(printf '%s' "${cw:-gruvbox}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
   SESS_BOLD=""
+  # Each colorway sets RGB triples ("r g b"); escapes are derived below so the
+  # graph/pie renderers can reuse the raw components (e.g. for backgrounds).
   case "$cw" in
     catppuccin|mocha|catppuccin-mocha)
-      CSESS=$(_rgb 203 166 247); CSYS=$(_rgb 137 180 250)
-      CCPU=$(_rgb 249 226 175);  CMEM=$(_rgb 166 227 161)
-      CSTORE=$(_rgb 250 179 135); CDIM=$(_rgb 108 112 134) ;;
+      CSESS_RGB="203 166 247"; CSYS_RGB="137 180 250"
+      CCPU_RGB="249 226 175";  CMEM_RGB="166 227 161"
+      CSTORE_RGB="250 179 135"; CDIM_RGB="108 112 134" ;;
     tokyo|tokyonight|tokyo-night)
-      CSESS=$(_rgb 187 154 247); CSYS=$(_rgb 122 162 247)
-      CCPU=$(_rgb 224 175 104);  CMEM=$(_rgb 158 206 106)
-      CSTORE=$(_rgb 255 158 100); CDIM=$(_rgb 86 95 137) ;;
+      CSESS_RGB="187 154 247"; CSYS_RGB="122 162 247"
+      CCPU_RGB="224 175 104";  CMEM_RGB="158 206 106"
+      CSTORE_RGB="255 158 100"; CDIM_RGB="86 95 137" ;;
     mono|minimal)
-      CSESS=$(_rgb 255 255 255); CSYS=$(_rgb 255 255 255)
-      CCPU=$(_rgb 205 214 244);  CMEM=$(_rgb 205 214 244)
-      CSTORE=$(_rgb 205 214 244); CDIM=$(_rgb 88 91 112); SESS_BOLD=$'\033[1m' ;;
+      CSESS_RGB="255 255 255"; CSYS_RGB="255 255 255"
+      CCPU_RGB="205 214 244";  CMEM_RGB="205 214 244"
+      CSTORE_RGB="205 214 244"; CDIM_RGB="88 91 112"; SESS_BOLD=$'\033[1m' ;;
+    lavish)
+      # opulent: amethyst + gold, neon magenta/aqua accents on a violet dim
+      CSESS_RGB="244 191 79";  CSYS_RGB="199 146 234"
+      CCPU_RGB="255 121 198";  CMEM_RGB="80 250 200"
+      CSTORE_RGB="255 184 108"; CDIM_RGB="108 99 142" ;;
     gruvbox|*)
-      CSESS=$(_rgb 211 134 155); CSYS=$(_rgb 131 165 152)
-      CCPU=$(_rgb 250 189 47);   CMEM=$(_rgb 184 187 38)
-      CSTORE=$(_rgb 254 128 25); CDIM=$(_rgb 146 131 116) ;;
+      CSESS_RGB="211 134 155"; CSYS_RGB="131 165 152"
+      CCPU_RGB="250 189 47";   CMEM_RGB="184 187 38"
+      CSTORE_RGB="254 128 25"; CDIM_RGB="146 131 116" ;;
   esac
+  CSESS=$(_rgb $CSESS_RGB);   CSYS=$(_rgb $CSYS_RGB)
+  CCPU=$(_rgb $CCPU_RGB);     CMEM=$(_rgb $CMEM_RGB)
+  CSTORE=$(_rgb $CSTORE_RGB); CDIM=$(_rgb $CDIM_RGB)
   COLORWAY="$cw"
 }
 
@@ -268,11 +281,129 @@ disk_free() { # arg: dir -> echoes "FREE_H CAP" e.g. "312G 22%"
     | { read -r free cap; printf '%s %s' "$(kb2h "$free")" "$cap"; }
 }
 
+# ---------- time-series history (per session/tty) ---------------------------
+# Recorded on every render, but at most one sample per HIST_STEP seconds so the
+# file stays bounded and evenly spaced. Columns: epoch scpu smem% syscpu symem%.
+hist_path() {
+  local key; key=$(session_tty); key="${key:-default}"
+  key=$(printf '%s' "$key" | cksum | awk '{print $1}')
+  printf '%s/%s' "$HIST_DIR" "$key"
+}
+record_history() { # args: scpu smem% syscpu symem%
+  local f last now_s; f=$(hist_path); now_s=$(now)
+  last=0; [ -f "$f" ] && last=$(tail -n1 "$f" 2>/dev/null | awk '{print $1+0}')
+  [ $(( now_s - ${last:-0} )) -lt "$HIST_STEP" ] && return
+  printf '%s %s %s %s %s\n' "$now_s" "${1:-0}" "${2:-0}" "${3:-0}" "${4:-0}" >> "$f"
+  # trim to the window so the file never grows without bound
+  awk -v c=$(( now_s - HIST_WINDOW )) '$1+0>=c' "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
+}
+hist_col() { # arg: column index (2=scpu 3=smem 4=syscpu 5=symem) -> "t v" pairs
+  local f; f=$(hist_path); [ -f "$f" ] || return
+  awk -v k="$1" '{print $1, $k}' "$f"
+}
+
+# ---------- braille time-graph ----------------------------------------------
+# stdin: "t v" pairs (v in 0..100+). Emits H rows of W braille cells (2x4 dots),
+# an area chart with sample-and-hold across the HIST_WINDOW, "now" on the right.
+braille_chart() { # args: W H now window
+  awk -v W="$1" -v H="$2" -v now="$3" -v window="$4" '
+    function dot(sc,sr){
+      if(sc==0) return (sr==0?1:(sr==1?2:(sr==2?4:64)))
+      else      return (sr==0?8:(sr==1?16:(sr==2?32:128)))
+    }
+    { n++; T[n]=$1+0; V[n]=$2+0 }
+    END{
+      if(window<=0) window=1
+      PXW=2*W; PXH=4*H; t0=now-window
+      for(cx=0;cx<PXW;cx++){
+        ct=t0+(cx/(PXW-1))*window; val=-1
+        for(i=1;i<=n;i++){ if(T[i]<=ct) val=V[i]; else break }
+        if(val<0){ col[cx]=-1; continue }
+        if(val>100)val=100; if(val<0)val=0; col[cx]=val
+      }
+      for(cx=0;cx<PXW;cx++){
+        v=col[cx]; if(v<0) continue
+        pyl=int((100-v)/100*(PXH-1)+0.5)
+        for(py=pyl;py<PXH;py++){
+          cc=int(cx/2); cr=int(py/4); G[cr SUBSEP cc]+=dot(cx%2,py%4)
+        }
+      }
+      for(cr=0;cr<H;cr++){
+        line=""
+        for(cc=0;cc<W;cc++){
+          cp=10240+(G[cr SUBSEP cc]+0); rem=cp%4096
+          line=line sprintf("%c%c%c",224+int(cp/4096),128+int(rem/64),128+(rem%64))
+        }
+        print line
+      }
+    }'
+}
+_chart() { # args: col -> one-row braille sparkgraph (no color) over HIST_WINDOW
+  hist_col "$1" | braille_chart "$GW" 1 "$(now)" "$HIST_WINDOW"
+}
+# Graph view mirrors the classic two-line layout (session row / system row),
+# CPU then MEM left-to-right, but swaps each static figure for a dense braille
+# time-graph of the last 30 min. Denser sampling (HIST_STEP) -> more points.
+view_graph() {
+  local GW="${AGENT_HUD_GRAPH_W:-16}"
+  local g_sc g_sm g_yc g_ym
+  g_sc=$(_chart 2); g_sm=$(_chart 3); g_yc=$(_chart 4); g_ym=$(_chart 5)
+  printf '%b⊳ session%b   %bCPU%b %b%s%b %b%3s%%%b   %bMEM%b %b%s%b %b%3s%%%b\n' \
+    "$SESS_BOLD$CSESS" "$R" "$CDIM" "$R" "$CCPU" "$g_sc" "$R" "$CCPU" "$s_cpu" "$R" \
+    "$CDIM" "$R" "$CMEM" "$g_sm" "$R" "$CMEM" "$s_mem_pct" "$R"
+  printf '%b⊳ system %b   %bCPU%b %b%s%b %b%3s%%%b   %bMEM%b %b%s%b %b%3s%%%b  %b· 30m▸now%b\n' \
+    "$SESS_BOLD$CSYS" "$R" "$CDIM" "$R" "$CCPU" "$g_yc" "$R" "$CCPU" "$sys_cpu_v" "$R" \
+    "$CDIM" "$R" "$CMEM" "$g_ym" "$R" "$CMEM" "$sys_mem_pct" "$R" "$CDIM" "$R"
+}
+
+# ---------- stacked block bars ----------------------------------------------
+_bar() { # args: pct width -> "<filled>\t<rest>" (tab-separated)
+  awk -v p="$1" -v w="$2" 'BEGIN{
+    if(p>100)p=100; if(p<0)p=0; f=int(p/100*w+0.5)
+    s=""; for(i=0;i<f;i++)s=s"█"; r=""; for(i=f;i<w;i++)r=r"░"; printf "%s\t%s", s, r }'
+}
+# Pie view, "unrolled": each metric as a proportional fill bar, same two-line
+# session/system layout with CPU then MEM going right.
+view_pie() {
+  local PW="${AGENT_HUD_PIE_W:-10}"
+  local cf cr mf mr
+  IFS=$'\t' read -r cf cr <<EOF
+$(_bar "$s_cpu" "$PW")
+EOF
+  IFS=$'\t' read -r mf mr <<EOF
+$(_bar "$s_mem_pct" "$PW")
+EOF
+  printf '%b⊳ session%b   %bCPU%b %b%s%b%b%s%b %b%3s%%%b   %bMEM%b %b%s%b%b%s%b %b%3s%%%b\n' \
+    "$SESS_BOLD$CSESS" "$R" "$CDIM" "$R" "$CCPU" "$cf" "$R" "$CDIM" "$cr" "$R" "$CCPU" "$s_cpu" "$R" \
+    "$CDIM" "$R" "$CMEM" "$mf" "$R" "$CDIM" "$mr" "$R" "$CMEM" "$s_mem_pct" "$R"
+  IFS=$'\t' read -r cf cr <<EOF
+$(_bar "$sys_cpu_v" "$PW")
+EOF
+  IFS=$'\t' read -r mf mr <<EOF
+$(_bar "$sys_mem_pct" "$PW")
+EOF
+  printf '%b⊳ system %b   %bCPU%b %b%s%b%b%s%b %b%3s%%%b   %bMEM%b %b%s%b%b%s%b %b%3s%%%b\n' \
+    "$SESS_BOLD$CSYS" "$R" "$CDIM" "$R" "$CCPU" "$cf" "$R" "$CDIM" "$cr" "$R" "$CCPU" "$sys_cpu_v" "$R" \
+    "$CDIM" "$R" "$CMEM" "$mf" "$R" "$CDIM" "$mr" "$R" "$CMEM" "$sys_mem_pct" "$R"
+}
+
 # ---------- render ----------------------------------------------------------
 cmd_render() {
-  local cwd="$PWD"
-  while [ $# -gt 0 ]; do case "$1" in --cwd) cwd="$2"; shift 2;; *) shift;; esac; done
+  local cwd="$PWD" view=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cwd)  cwd="$2"; shift 2 ;;
+      --view) view="$2"; shift 2 ;;
+      *)      shift ;;
+    esac
+  done
   [ -d "$cwd" ] || cwd="$PWD"
+  view="${view:-${AGENT_HUD_VIEW:-classic}}"
+  # the lavish views default to the lavish colorway unless one is explicitly set
+  if [ "$view" != classic ] && [ -z "${AGENT_HUD_COLORWAY:-}" ] \
+     && ! { [ -f "$CONFIG" ] && grep -q '^colorway' "$CONFIG" 2>/dev/null; }; then
+    AGENT_HUD_COLORWAY=lavish
+  fi
   resolve_colorway
 
   # session
@@ -300,7 +431,15 @@ EOF
   local sys_mem="${sys_mem_str} (${sys_mem_pct}%)"
   local disk_str="${d_free} free (${d_cap} used)"
 
-  # line 1: session  (labels padded so columns align with line 2)
+  # feed the time-series (used by the graph view) regardless of active view
+  record_history "$s_cpu" "$s_mem_pct" "$sys_cpu_v" "$sys_mem_pct"
+
+  case "$view" in
+    graph) view_graph; return ;;
+    pie)   view_pie;   return ;;
+  esac
+
+  # classic two-line HUD (labels padded so columns align with line 2)
   printf '%b⊳ session%b   %bCPU%b %b%4s%%%b   %bMEM%b %b%-18s%b %bpwd %b %b%s%b\n' \
     "$SESS_BOLD$CSESS" "$R" "$CDIM" "$R" "$CCPU" "$s_cpu" "$R" \
     "$CDIM" "$R" "$CMEM" "$sess_mem" "$R" "$CDIM" "$R" "$CSTORE" "$pwd_h" "$R"
@@ -323,27 +462,43 @@ cmd_colorways() {
   echo "  gruvbox      (default, warm)"
   echo "  catppuccin   (matches Catppuccin Mocha)"
   echo "  tokyonight"
+  echo "  lavish       (opulent amethyst + gold; default for graph/pie views)"
   echo "  mono         (labels only)"
 }
 
 cmd_help() {
   cat <<EOF
-agent-hud — two-level resource HUD for agent status lines
+agent-hud — multi-view resource HUD for agent status lines
 
 USAGE
-  agent-hud render [--cwd DIR]   print the 2-line HUD (session / system)
+  agent-hud render [--cwd DIR]   print the HUD in the active view (default: classic)
+  agent-hud classic [--cwd DIR]  the 2-line session / system HUD
+  agent-hud graph  [--cwd DIR]   classic layout w/ braille 30-min time-graphs
+  agent-hud pie    [--cwd DIR]   classic layout w/ proportional usage bars
   agent-hud daemon               sample system CPU%% into the cache (run via launchd/systemd)
   agent-hud colorways            list built-in colorways
   agent-hud help
 
+VIEWS
+  Pick the statusline view with AGENT_HUD_VIEW=classic|graph|pie (or use the
+  subcommands above). graph/pie default to the 'lavish' colorway.
+
 CONFIG
-  AGENT_HUD_COLORWAY   colorway name (default: gruvbox)
-  $CONFIG              optional, e.g.  colorway=gruvbox
+  AGENT_HUD_COLORWAY    colorway name (default: gruvbox)
+  AGENT_HUD_VIEW        classic | graph | pie (default: classic)
+  AGENT_HUD_GRAPH_W     per-metric braille graph width (cells)           [16]
+  AGENT_HUD_PIE_W       per-metric usage bar width (cells)               [10]
+  AGENT_HUD_HIST_WINDOW time span of the graph in seconds                [1800]
+  AGENT_HUD_HIST_STEP   min seconds between recorded samples             [5]
+  $CONFIG               optional, e.g.  colorway=lavish
 EOF
 }
 
 case "${1:-render}" in
   render)    shift; cmd_render "$@" ;;
+  classic)   shift; cmd_render --view classic "$@" ;;
+  graph)     shift; cmd_render --view graph "$@" ;;
+  pie)       shift; cmd_render --view pie "$@" ;;
   daemon)    cmd_daemon ;;
   colorways) cmd_colorways ;;
   help|-h|--help) cmd_help ;;

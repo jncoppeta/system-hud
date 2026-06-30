@@ -14,6 +14,26 @@ A portable **two-level resource HUD** for AI-agent status lines. One core script
 - **Bottom line — the whole machine:** system CPU%, used/total RAM, and free disk
   on the cwd's volume. MEM and disk carry a parenthetical `%`.
 
+## Views
+
+The same session/system layout renders in three interchangeable views. Switch
+with `AGENT_HUD_VIEW=classic|graph|pie` (or run the subcommand directly):
+
+```
+# graph — each figure becomes a dense braille time-graph of the last 30 min
+⊳ session   CPU ⢠⣤⣶⣿⣷⣦⣄⣀⣠⣴⣶⣷⣦⣄ 14%   MEM ⣀⣠⣤⣶⣷⣿⣿⣿⣿⣿⣿⣿ 31%
+⊳ system    CPU ⣷⣦⣄⣠⣤⣶⣿⣷⣦⣄⣀⣠⣶ 42%   MEM ⣷⣿⣿⣿⣷⣶⣷⣿⣿⣷⣶⣷ 68%  · 30m▸now
+
+# pie — each metric "unrolled" into a proportional used/free bar
+⊳ session   CPU █▍░░░░░░░ 14%   MEM ███░░░░░░ 31%
+⊳ system    CPU ████░░░░░ 42%   MEM ███████░░ 68%
+```
+
+`graph` reads a small per-tty history ring buffer that every render feeds (one
+sample per `AGENT_HUD_HIST_STEP` seconds, kept for `AGENT_HUD_HIST_WINDOW`).
+`graph`/`pie` default to the `lavish` colorway unless you set one explicitly.
+See `agent-hud help` for `AGENT_HUD_GRAPH_W` / `AGENT_HUD_PIE_W` and friends.
+
 ## How it works
 
 | Metric           | Source (macOS / Linux)                                          |
